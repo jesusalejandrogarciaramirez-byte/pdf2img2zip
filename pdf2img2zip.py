@@ -12,21 +12,17 @@ from typing import Tuple
 # ----------------------------
 # CONFIGURACIÓN DE LA APP
 # ----------------------------
-st.set_page_config(page_title="PDF a JPG + ZIP", layout="wide")
+st.set_page_config(page_title="PDF a JPG + ZIP", layout="centered")
 
-# Límite real observado en Streamlit
 MAX_STREAMLIT_MB = 200
 SAFE_THRESHOLD_MB = 195
+WAIT_SECONDS = 4  # cámbialo aquí si después quieres otro valor
 
-# Tiempo fijo entre archivos (modifícalo aquí si quieres)
-WAIT_SECONDS = 4
-
-st.markdown("<h1 style='text-align: center;'>Convertidor de PDF a JPG</h1>", unsafe_allow_html=True)
-st.markdown(
-    "<h4 style='text-align: center; color: gray;'>Extrae cada página como JPG y genera un ZIP descargable</h4>",
-    unsafe_allow_html=True
-)
-st.write("---")
+# ----------------------------
+# ENCABEZADO SIMPLE
+# ----------------------------
+st.title("Convertidor de PDF a JPG")
+st.caption("Extrae cada página como JPG y genera un ZIP descargable")
 
 # ----------------------------
 # ESTADO DE SESIÓN
@@ -49,16 +45,10 @@ if "lote_actual" not in st.session_state:
 # ----------------------------
 # OPCIONES DE EXPORTACIÓN
 # ----------------------------
-st.subheader("Configuración de exportación")
 perfil_calidad = st.selectbox(
-    "Selecciona la calidad inicial",
+    "Selecciona la calidad",
     options=["Alta", "Media alta", "Media", "Media baja", "Baja"],
     index=4  # Baja por default
-)
-
-st.caption(
-    f"La descarga automática espera {WAIT_SECONDS} segundos entre archivos. "
-    "Si un ZIP sale muy grande, la app reducirá automáticamente la calidad solo para ese archivo."
 )
 
 # ----------------------------
@@ -149,7 +139,6 @@ def convertir_pdf_a_zip(pdf_file, perfil_calidad="Baja", mostrar_progreso=False)
                 zip_file.writestr(nombre_imagen, imagen_bytes)
 
                 del imagen_bytes
-                gc.collect()
 
                 if mostrar_progreso:
                     progreso = i / total_paginas
@@ -324,15 +313,13 @@ if uploaded_files:
                         f"Proceso detenido: {pdf_file.name} todavía supera el límite de {MAX_STREAMLIT_MB} MB."
                     )
                 else:
-                    # Descarga automática
                     st.components.v1.html(
                         generar_html_descarga_automatica(zip_bytes, zip_name),
                         height=0
                     )
 
-                    st.warning(
-                        f"Se lanzó la descarga automática. La app esperará {WAIT_SECONDS} segundos "
-                        "antes de liberar memoria y continuar con el siguiente archivo."
+                    st.caption(
+                        f"Descarga automática enviada. Esperando {WAIT_SECONDS} segundos antes de continuar..."
                     )
 
                     time.sleep(WAIT_SECONDS)
@@ -381,4 +368,4 @@ if uploaded_files:
             st.write(f"- {nombre}: {calidad}")
 
 else:
-    st.info("Sube uno o varios PDFs para comenzar automáticamente.")
+    st.caption("Sube uno o varios PDFs para comenzar automáticamente.")
