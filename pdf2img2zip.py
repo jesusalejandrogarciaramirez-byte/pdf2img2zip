@@ -1,5 +1,4 @@
 import streamlit as st
-import streamlit.components.v1 as components
 import fitz  # PyMuPDF
 from PIL import Image
 import io
@@ -262,6 +261,10 @@ def convertir_pdf_con_ajuste_automatico(pdf_file, perfil_inicial) -> Dict[str, A
 
 
 def render_descarga_nativa_y_autoclick(zip_bytes: bytes, zip_name: str, file_index: int):
+    """
+    Usa st.download_button para la transferencia real.
+    Usa st.html con JavaScript para hacer clic automático en el botón.
+    """
     label = f"Descargar {zip_name}"
     button_key = f"download_btn_{file_index}_{zip_name}"
 
@@ -271,6 +274,7 @@ def render_descarga_nativa_y_autoclick(zip_bytes: bytes, zip_name: str, file_ind
         file_name=zip_name,
         mime="application/zip",
         key=button_key,
+        on_click="ignore",  # evita rerun al hacer clic
     )
 
     autoclick_id = f"autoclick_{file_index}_{zip_name}"
@@ -278,34 +282,27 @@ def render_descarga_nativa_y_autoclick(zip_bytes: bytes, zip_name: str, file_ind
         st.session_state.ultimo_autoclick_id = autoclick_id
 
         label_js = json.dumps(label)
-        html = f"""
-        <html>
-        <body>
+
+        js = f"""
         <script>
         const targetText = {label_js};
 
         function findAndClickButton() {{
-            try {{
-                const parentDoc = window.parent.document;
-                const buttons = Array.from(parentDoc.querySelectorAll("button"));
-                const target = buttons.find(btn => (btn.innerText || "").trim() === targetText);
+            const buttons = Array.from(window.parent.document.querySelectorAll("button"));
+            const target = buttons.find(btn => (btn.innerText || "").trim() === targetText);
 
-                if (target) {{
-                    target.click();
-                }} else {{
-                    setTimeout(findAndClickButton, 300);
-                }}
-            }} catch (e) {{
-                setTimeout(findAndClickButton, 500);
+            if (target) {{
+                target.click();
+            }} else {{
+                setTimeout(findAndClickButton, 250);
             }}
         }}
 
-        setTimeout(findAndClickButton, 500);
+        setTimeout(findAndClickButton, 300);
         </script>
-        </body>
-        </html>
         """
-        components.html(html, height=0, width=0)
+
+        st.html(js, unsafe_allow_javascript=True)
 
 
 def limpiar_memoria_objetos(*objetos):
@@ -331,7 +328,6 @@ def reiniciar_lote():
     st.session_state.ultimo_autoclick_id = None
     st.session_state.procesados = set()
     st.session_state.pending_download = None
-
 
 # ----------------------------
 # INICIO AUTOMÁTICO DEL PROCESO
@@ -454,7 +450,6 @@ if uploaded_files:
                         "dpi": dpi,
                         "jpg_quality": jpg_quality,
                         "perfil_usado": perfil_usado,
-                        "tamano_zip_mb": tamano_zip_mb,
                         "tamano_mb": tamano_zip_mb,
                         "historial": historial,
                         "file_index": indice_actual,
@@ -466,7 +461,9 @@ if uploaded_files:
 
             except Exception as e:
                 st.session_state.proceso_activo = False
-                st.error(f"No se pudo procesar {pdf_file.name}: {e}")
+                st.error(f
+::contentReference[oaicite:6]{index=6}
+"No se pudo procesar {pdf_file.name}: {e}")
                 gc.collect()
         else:
             st.session_state.proceso_activo = False
@@ -474,7 +471,7 @@ if uploaded_files:
 
     progreso = 0
     if total_archivos > 0:
-        progreso = min(st.session_state.indice_actual / total_archivos, 1.0)
+        progreso = min(len(st.session_state.procesados) / total_archivos, 1.0)
 
     st.progress(progreso)
 
