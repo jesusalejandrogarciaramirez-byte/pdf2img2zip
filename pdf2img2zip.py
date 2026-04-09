@@ -7,7 +7,7 @@ import os
 import base64
 import gc
 import time
-from typing import Tuple
+from typing import Tuple, Optional, Dict, Any
 
 # ----------------------------
 # CONFIGURACIÓN DE LA APP
@@ -17,6 +17,16 @@ st.set_page_config(page_title="PDF a JPG + ZIP", layout="centered")
 MAX_STREAMLIT_MB = 200
 SAFE_THRESHOLD_MB = 195
 WAIT_SECONDS = 4  # cámbialo aquí si después quieres otro valor
+
+# Ajustes extra cuando "Baja" no sea suficiente
+# (dpi, jpeg_quality, etiqueta)
+ADVANCED_FALLBACKS = [
+    (96, 70, "Baja"),
+    (90, 65, "Baja+"),
+    (84, 60, "Baja++"),
+    (72, 55, "Baja+++"),
+    (60, 50, "Baja++++"),
+]
 
 # ----------------------------
 # ENCABEZADO SIMPLE
@@ -79,7 +89,7 @@ def obtener_parametros_calidad(perfil: str) -> Tuple[int, int]:
     return mapa.get(perfil, (96, 70))
 
 
-def siguiente_perfil_mas_bajo(perfil_actual: str):
+def siguiente_perfil_mas_bajo(perfil_actual: str) -> Optional[str]:
     niveles = ["Alta", "Media alta", "Media", "Media baja", "Baja"]
     if perfil_actual not in niveles:
         return "Baja"
@@ -93,7 +103,7 @@ def dpi_a_zoom(dpi: int) -> float:
     return dpi / 72.0
 
 
-def renderizar_pagina_como_jpg(page, dpi=96, jpg_quality=70):
+def renderizar_pagina_como_jpg(page, dpi=96, jpg_quality=70) -> bytes:
     zoom = dpi_a_zoom(dpi)
     matrix = fitz.Matrix(zoom, zoom)
     pix = page.get_pixmap(matrix=matrix, alpha=False)
@@ -114,13 +124,25 @@ def renderizar_pagina_como_jpg(page, dpi=96, jpg_quality=70):
     return jpg_bytes
 
 
-def convertir_pdf_a_zip(pdf_file, perfil_calidad="Baja", mostrar_progreso=False):
+def convertir_pdf_a_zip(
+    pdf_file,
+    perfil_calidad="Baja",
+    mostrar_progreso=False,
+    dpi_override: Optional[int] = None,
+    jpg_quality_override: Optional[int] = None,
+    etiqueta_progreso: Optional[str] = None,
+):
     nombre_base = limpiar_nombre_archivo(pdf_file.name)
     pdf_bytes = pdf_file.getvalue()
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
 
     total_paginas = len(doc)
-    dpi, jpg_quality = obtener_parametros_calidad(perfil_calidad)
+
+    if dpi_override is not None and jpg_quality_override is not None:
+        dpi = dpi_override
+        jpg_quality = jpg_quality_override
+    else:
+        dpi, jpg_quality = obtener_parametros_calidad(perfil_calidad)
 
     zip_buffer = io.BytesIO()
 
@@ -128,7 +150,8 @@ def convertir_pdf_a_zip(pdf_file, perfil_calidad="Baja", mostrar_progreso=False)
     estado = None
 
     if mostrar_progreso:
-        barra = st.progress(0, text=f"Procesando {pdf_file.name}...")
+        texto = etiqueta_progreso or f"Procesando {pdf_file.name}..."
+        barra = st.progress(0, text=texto)
         estado = st.empty()
 
     try:
@@ -142,7 +165,8 @@ def convertir_pdf_a_zip(pdf_file, perfil_calidad="Baja", mostrar_progreso=False)
 
                 if mostrar_progreso:
                     progreso = i / total_paginas
-                    barra.progress(progreso, text=f"Procesando {pdf_file.name}...")
+                    texto = etiqueta_progreso or f"Procesando {pdf_file.name}..."
+                    barra.progress(progreso, text=texto)
                     estado.caption(f"Página {i} de {total_paginas}")
 
         zip_bytes = zip_buffer.getvalue()
@@ -161,19 +185,28 @@ def convertir_pdf_a_zip(pdf_file, perfil_calidad="Baja", mostrar_progreso=False)
     return zip_bytes, f"{nombre_base}.zip", total_paginas, dpi, jpg_quality
 
 
-def convertir_pdf_con_ajuste_automatico(pdf_file, perfil_inicial):
-    perfil_actual = perfil_inicial
+def convertir_pdf_con_ajuste_automatico(pdf_file, perfil_inicial) -> Dict[str, Any]:
     historial = []
+
+    # 1) Intentos por perfil normal
+    perfil_actual = perfil_inicial
 
     while True:
         zip_bytes, zip_name, total_paginas, dpi, jpg_quality = convertir_pdf_a_zip(
             pdf_file,
             perfil_calidad=perfil_actual,
-            mostrar_progreso=True
+            mostrar_progreso=True,
+            etiqueta_progreso=f"Procesando {pdf_file.name} con perfil {perfil_actual}..."
         )
 
         tamano_mb = len(zip_bytes) / (1024 * 1024)
-        historial.append((perfil_actual, tamano_mb))
+        historial.append({
+            "modo": "perfil",
+            "etiqueta": perfil_actual,
+            "dpi": dpi,
+            "jpg_quality": jpg_quality,
+            "tamano_mb": tamano_mb
+        })
 
         if tamano_mb < SAFE_THRESHOLD_MB:
             return {
@@ -191,30 +224,78 @@ def convertir_pdf_con_ajuste_automatico(pdf_file, perfil_inicial):
         siguiente = siguiente_perfil_mas_bajo(perfil_actual)
 
         if siguiente is None:
-            return {
-                "ok": tamano_mb < MAX_STREAMLIT_MB,
-                "zip_bytes": zip_bytes,
-                "zip_name": zip_name,
-                "total_paginas": total_paginas,
-                "dpi": dpi,
-                "jpg_quality": jpg_quality,
-                "perfil_usado": perfil_actual,
-                "tamano_mb": tamano_mb,
-                "historial": historial
-            }
-
-        del zip_bytes
-        gc.collect()
+            del zip_bytes
+            gc.collect()
+            break
 
         st.warning(
             f"El ZIP de {pdf_file.name} salió con {tamano_mb:.2f} MB usando '{perfil_actual}'. "
             f"Se reintentará automáticamente con '{siguiente}'."
         )
 
+        del zip_bytes
+        gc.collect()
         perfil_actual = siguiente
 
+    # 2) Si ya no alcanzó con Baja, hacer reducción avanzada
+    st.warning(
+        f"Ni siquiera con 'Baja' se logró un tamaño seguro para {pdf_file.name}. "
+        "Se activará reducción avanzada automática."
+    )
 
-def generar_html_descarga_automatica(zip_bytes: bytes, zip_name: str):
+    ultimo_resultado = None
+
+    for dpi, jpg_quality, etiqueta in ADVANCED_FALLBACKS:
+        zip_bytes, zip_name, total_paginas, dpi_real, jpg_quality_real = convertir_pdf_a_zip(
+            pdf_file,
+            perfil_calidad="Baja",
+            mostrar_progreso=True,
+            dpi_override=dpi,
+            jpg_quality_override=jpg_quality,
+            etiqueta_progreso=f"Procesando {pdf_file.name} con ajuste {etiqueta}..."
+        )
+
+        tamano_mb = len(zip_bytes) / (1024 * 1024)
+        historial.append({
+            "modo": "ajuste_avanzado",
+            "etiqueta": etiqueta,
+            "dpi": dpi_real,
+            "jpg_quality": jpg_quality_real,
+            "tamano_mb": tamano_mb
+        })
+
+        ultimo_resultado = {
+            "ok": tamano_mb < MAX_STREAMLIT_MB,
+            "zip_bytes": zip_bytes,
+            "zip_name": zip_name,
+            "total_paginas": total_paginas,
+            "dpi": dpi_real,
+            "jpg_quality": jpg_quality_real,
+            "perfil_usado": etiqueta,
+            "tamano_mb": tamano_mb,
+            "historial": historial
+        }
+
+        if tamano_mb < SAFE_THRESHOLD_MB:
+            ultimo_resultado["ok"] = True
+            return ultimo_resultado
+
+        if tamano_mb < MAX_STREAMLIT_MB:
+            return ultimo_resultado
+
+        st.warning(
+            f"Con ajuste {etiqueta}, el ZIP quedó en {tamano_mb:.2f} MB. "
+            "Se intentará un ajuste más agresivo."
+        )
+
+        if etiqueta != ADVANCED_FALLBACKS[-1][2]:
+            del zip_bytes
+            gc.collect()
+
+    return ultimo_resultado
+
+
+def generar_html_descarga_automatica(zip_bytes: bytes, zip_name: str) -> str:
     b64 = base64.b64encode(zip_bytes).decode()
     html = f"""
     <html>
@@ -243,7 +324,7 @@ def limpiar_memoria_objetos(*objetos):
     gc.collect()
 
 
-def obtener_firma_lote(files):
+def obtener_firma_lote(files) -> Optional[str]:
     if not files:
         return None
     return "|".join([f"{f.name}-{f.size}" for f in files])
@@ -289,28 +370,33 @@ if uploaded_files:
                 perfil_usado = resultado["perfil_usado"]
                 tamano_zip_mb = resultado["tamano_mb"]
 
-                st.session_state.ultima_calidad_usada[pdf_file.name] = perfil_usado
+                st.session_state.ultima_calidad_usada[pdf_file.name] = (
+                    f"{perfil_usado} | {dpi} DPI | JPG {jpg_quality}"
+                )
 
                 st.success(f"Conversión completada: {pdf_file.name}")
                 st.caption(
-                    f"Páginas: {total_paginas} | Perfil usado: {perfil_usado} | "
+                    f"Páginas: {total_paginas} | Ajuste usado: {perfil_usado} | "
                     f"Resolución: {dpi} DPI | Calidad JPG: {jpg_quality} | "
                     f"Tamaño ZIP: {tamano_zip_mb:.2f} MB"
                 )
 
                 if len(resultado["historial"]) > 1:
-                    texto_historial = " → ".join(
-                        [f"{perfil} ({mb:.2f} MB)" for perfil, mb in resultado["historial"]]
-                    )
-                    st.info(f"Ajuste automático aplicado: {texto_historial}")
+                    st.write("### Historial de ajustes")
+                    for intento in resultado["historial"]:
+                        st.write(
+                            f"- {intento['etiqueta']} | "
+                            f"{intento['dpi']} DPI | JPG {intento['jpg_quality']} | "
+                            f"{intento['tamano_mb']:.2f} MB"
+                        )
 
                 if tamano_zip_mb >= MAX_STREAMLIT_MB:
                     st.error(
-                        f"El ZIP final quedó en {tamano_zip_mb:.2f} MB y rebasa el límite de Streamlit."
+                        f"El ZIP final quedó en {tamano_zip_mb:.2f} MB y todavía rebasa el límite de Streamlit."
                     )
                     st.session_state.proceso_activo = False
                     st.session_state.mensaje_final = (
-                        f"Proceso detenido: {pdf_file.name} todavía supera el límite de {MAX_STREAMLIT_MB} MB."
+                        f"Proceso detenido: {pdf_file.name} aún supera el límite de {MAX_STREAMLIT_MB} MB."
                     )
                 else:
                     st.components.v1.html(
@@ -363,7 +449,7 @@ if uploaded_files:
     st.write(f"Pendientes: {restantes}")
 
     if st.session_state.ultima_calidad_usada:
-        st.write("### Calidad final usada por archivo")
+        st.write("### Ajuste final usado por archivo")
         for nombre, calidad in st.session_state.ultima_calidad_usada.items():
             st.write(f"- {nombre}: {calidad}")
 
