@@ -19,15 +19,10 @@ MAX_STREAMLIT_MB = 200
 SAFE_THRESHOLD_MB = 195
 WAIT_SECONDS = 4  # cámbialo aquí si después quieres otro valor
 
-# Ajustes extra cuando "Baja" no sea suficiente
-# (dpi, jpeg_quality, etiqueta)
-ADVANCED_FALLBACKS = [
-    (96, 70, "Baja"),
-    (90, 65, "Baja+"),
-    (84, 60, "Baja++"),
-    (72, 55, "Baja+++"),
-    (60, 50, "Baja++++"),
-]
+# Un solo ajuste extra si el primero no alcanza
+EMERGENCY_DPI = 72
+EMERGENCY_JPG_QUALITY = 55
+EMERGENCY_LABEL = "Baja emergencia"
 
 # ----------------------------
 # ENCABEZADO SIMPLE
@@ -91,16 +86,6 @@ def obtener_parametros_calidad(perfil: str) -> Tuple[int, int]:
         "Baja": (96, 70),
     }
     return mapa.get(perfil, (96, 70))
-
-
-def siguiente_perfil_mas_bajo(perfil_actual: str) -> Optional[str]:
-    niveles = ["Alta", "Media alta", "Media", "Media baja", "Baja"]
-    if perfil_actual not in niveles:
-        return "Baja"
-    idx = niveles.index(perfil_actual)
-    if idx < len(niveles) - 1:
-        return niveles[idx + 1]
-    return None
 
 
 def dpi_a_zoom(dpi: int) -> float:
@@ -190,121 +175,84 @@ def convertir_pdf_a_zip(
 
 
 def convertir_pdf_con_ajuste_automatico(pdf_file, perfil_inicial) -> Dict[str, Any]:
+    """
+    Estrategia rápida:
+    1. Hace un solo intento con la calidad elegida.
+    2. Solo si supera el umbral, hace un único reintento de emergencia.
+    """
     historial = []
 
-    # 1) Intentos por perfil normal
-    perfil_actual = perfil_inicial
-
-    while True:
-        zip_bytes, zip_name, total_paginas, dpi, jpg_quality = convertir_pdf_a_zip(
-            pdf_file,
-            perfil_calidad=perfil_actual,
-            mostrar_progreso=True,
-            etiqueta_progreso=f"Procesando {pdf_file.name} con perfil {perfil_actual}..."
-        )
-
-        tamano_mb = len(zip_bytes) / (1024 * 1024)
-        historial.append({
-            "modo": "perfil",
-            "etiqueta": perfil_actual,
-            "dpi": dpi,
-            "jpg_quality": jpg_quality,
-            "tamano_mb": tamano_mb
-        })
-
-        if tamano_mb < SAFE_THRESHOLD_MB:
-            return {
-                "ok": True,
-                "zip_bytes": zip_bytes,
-                "zip_name": zip_name,
-                "total_paginas": total_paginas,
-                "dpi": dpi,
-                "jpg_quality": jpg_quality,
-                "perfil_usado": perfil_actual,
-                "tamano_mb": tamano_mb,
-                "historial": historial
-            }
-
-        siguiente = siguiente_perfil_mas_bajo(perfil_actual)
-
-        if siguiente is None:
-            del zip_bytes
-            gc.collect()
-            break
-
-        st.warning(
-            f"El ZIP de {pdf_file.name} salió con {tamano_mb:.2f} MB usando '{perfil_actual}'. "
-            f"Se reintentará automáticamente con '{siguiente}'."
-        )
-
-        del zip_bytes
-        gc.collect()
-        perfil_actual = siguiente
-
-    # 2) Si ya no alcanzó con Baja, hacer reducción avanzada
-    st.warning(
-        f"Ni siquiera con 'Baja' se logró un tamaño seguro para {pdf_file.name}. "
-        "Se activará reducción avanzada automática."
+    # Primer intento normal
+    zip_bytes, zip_name, total_paginas, dpi, jpg_quality = convertir_pdf_a_zip(
+        pdf_file,
+        perfil_calidad=perfil_inicial,
+        mostrar_progreso=True,
+        etiqueta_progreso=f"Procesando {pdf_file.name}..."
     )
 
-    ultimo_resultado = None
+    tamano_mb = len(zip_bytes) / (1024 * 1024)
+    historial.append({
+        "modo": "normal",
+        "etiqueta": perfil_inicial,
+        "dpi": dpi,
+        "jpg_quality": jpg_quality,
+        "tamano_mb": tamano_mb
+    })
 
-    for dpi, jpg_quality, etiqueta in ADVANCED_FALLBACKS:
-        zip_bytes, zip_name, total_paginas, dpi_real, jpg_quality_real = convertir_pdf_a_zip(
-            pdf_file,
-            perfil_calidad="Baja",
-            mostrar_progreso=True,
-            dpi_override=dpi,
-            jpg_quality_override=jpg_quality,
-            etiqueta_progreso=f"Procesando {pdf_file.name} con ajuste {etiqueta}..."
-        )
-
-        tamano_mb = len(zip_bytes) / (1024 * 1024)
-        historial.append({
-            "modo": "ajuste_avanzado",
-            "etiqueta": etiqueta,
-            "dpi": dpi_real,
-            "jpg_quality": jpg_quality_real,
-            "tamano_mb": tamano_mb
-        })
-
-        ultimo_resultado = {
-            "ok": tamano_mb < MAX_STREAMLIT_MB,
+    if tamano_mb < SAFE_THRESHOLD_MB:
+        return {
+            "ok": True,
             "zip_bytes": zip_bytes,
             "zip_name": zip_name,
             "total_paginas": total_paginas,
-            "dpi": dpi_real,
-            "jpg_quality": jpg_quality_real,
-            "perfil_usado": etiqueta,
+            "dpi": dpi,
+            "jpg_quality": jpg_quality,
+            "perfil_usado": perfil_inicial,
             "tamano_mb": tamano_mb,
             "historial": historial
         }
 
-        if tamano_mb < SAFE_THRESHOLD_MB:
-            ultimo_resultado["ok"] = True
-            return ultimo_resultado
+    # Solo si hizo falta, un segundo intento
+    st.warning(
+        f"El ZIP de {pdf_file.name} quedó en {tamano_mb:.2f} MB. "
+        f"Se intentará un ajuste extra para evitar rebasar el límite."
+    )
 
-        if tamano_mb < MAX_STREAMLIT_MB:
-            return ultimo_resultado
+    del zip_bytes
+    gc.collect()
 
-        st.warning(
-            f"Con ajuste {etiqueta}, el ZIP quedó en {tamano_mb:.2f} MB. "
-            "Se intentará un ajuste más agresivo."
-        )
+    zip_bytes, zip_name, total_paginas, dpi2, jpg_quality2 = convertir_pdf_a_zip(
+        pdf_file,
+        perfil_calidad=perfil_inicial,
+        mostrar_progreso=True,
+        dpi_override=EMERGENCY_DPI,
+        jpg_quality_override=EMERGENCY_JPG_QUALITY,
+        etiqueta_progreso=f"Reprocesando {pdf_file.name} con ajuste de emergencia..."
+    )
 
-        if etiqueta != ADVANCED_FALLBACKS[-1][2]:
-            del zip_bytes
-            gc.collect()
+    tamano_mb_2 = len(zip_bytes) / (1024 * 1024)
+    historial.append({
+        "modo": "emergencia",
+        "etiqueta": EMERGENCY_LABEL,
+        "dpi": dpi2,
+        "jpg_quality": jpg_quality2,
+        "tamano_mb": tamano_mb_2
+    })
 
-    return ultimo_resultado
+    return {
+        "ok": tamano_mb_2 < MAX_STREAMLIT_MB,
+        "zip_bytes": zip_bytes,
+        "zip_name": zip_name,
+        "total_paginas": total_paginas,
+        "dpi": dpi2,
+        "jpg_quality": jpg_quality2,
+        "perfil_usado": EMERGENCY_LABEL,
+        "tamano_mb": tamano_mb_2,
+        "historial": historial
+    }
 
 
 def render_descarga_nativa_y_autoclick(zip_bytes: bytes, zip_name: str, file_index: int):
-    """
-    Usa st.download_button para la transferencia real del archivo.
-    Luego usa un pequeño script en components.html para hacer click automático
-    sobre ese botón nativo. Así evitamos convertir el ZIP a base64.
-    """
     label = f"Descargar {zip_name}"
     button_key = f"download_btn_{file_index}_{zip_name}"
 
@@ -439,8 +387,7 @@ if uploaded_files:
                     render_descarga_nativa_y_autoclick(zip_bytes, zip_name, indice_actual)
 
                     st.caption(
-                        f"Descarga automática enviada con el botón nativo de Streamlit. "
-                        f"Esperando {WAIT_SECONDS} segundos antes de continuar..."
+                        f"Descarga automática enviada. Esperando {WAIT_SECONDS} segundos antes de continuar..."
                     )
 
                     time.sleep(WAIT_SECONDS)
