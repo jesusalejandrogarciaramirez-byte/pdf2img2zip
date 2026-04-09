@@ -461,10 +461,9 @@ if uploaded_files:
 
             except Exception as e:
                 st.session_state.proceso_activo = False
-                st.error(f
-::contentReference[oaicite:6]{index=6}
-"No se pudo procesar {pdf_file.name}: {e}")
-                gc.collect()
+                st.error(
+                    f"El ZIP final quedó en {tamano_zip_mb:.2f} MB y todavía rebasa el límite de Streamlit."
+                )
         else:
             st.session_state.proceso_activo = False
             st.session_state.mensaje_final = "Todos los archivos fueron procesados."
