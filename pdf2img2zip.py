@@ -51,6 +51,12 @@ if "lote_actual" not in st.session_state:
 if "ultimo_autoclick_id" not in st.session_state:
     st.session_state.ultimo_autoclick_id = None
 
+if "procesados" not in st.session_state:
+    st.session_state.procesados = set()
+
+if "pending_download" not in st.session_state:
+    st.session_state.pending_download = None
+
 # ----------------------------
 # OPCIONES DE EXPORTACIÓN
 # ----------------------------
@@ -75,6 +81,10 @@ uploaded_files = st.file_uploader(
 def limpiar_nombre_archivo(nombre: str) -> str:
     base = os.path.splitext(nombre)[0]
     return base.strip()
+
+
+def obtener_id_archivo(pdf_file) -> str:
+    return f"{pdf_file.name}_{pdf_file.size}"
 
 
 def obtener_parametros_calidad(perfil: str) -> Tuple[int, int]:
@@ -212,7 +222,6 @@ def convertir_pdf_con_ajuste_automatico(pdf_file, perfil_inicial) -> Dict[str, A
             "historial": historial
         }
 
-    # Solo si hizo falta, un segundo intento
     st.warning(
         f"El ZIP de {pdf_file.name} quedó en {tamano_mb:.2f} MB. "
         f"Se intentará un ajuste extra para evitar rebasar el límite."
@@ -313,6 +322,17 @@ def obtener_firma_lote(files) -> Optional[str]:
         return None
     return "|".join([f"{f.name}-{f.size}" for f in files])
 
+
+def reiniciar_lote():
+    st.session_state.proceso_activo = True
+    st.session_state.indice_actual = 0
+    st.session_state.mensaje_final = ""
+    st.session_state.ultima_calidad_usada = {}
+    st.session_state.ultimo_autoclick_id = None
+    st.session_state.procesados = set()
+    st.session_state.pending_download = None
+
+
 # ----------------------------
 # INICIO AUTOMÁTICO DEL PROCESO
 # ----------------------------
@@ -321,11 +341,7 @@ if uploaded_files:
 
     if st.session_state.lote_actual != firma_lote:
         st.session_state.lote_actual = firma_lote
-        st.session_state.proceso_activo = True
-        st.session_state.indice_actual = 0
-        st.session_state.mensaje_final = ""
-        st.session_state.ultima_calidad_usada = {}
-        st.session_state.ultimo_autoclick_id = None
+        reiniciar_lote()
         st.rerun()
 
 # ----------------------------
@@ -336,11 +352,76 @@ if uploaded_files:
     st.subheader("Estado del procesamiento")
 
     total_archivos = len(uploaded_files)
-    indice_actual = st.session_state.indice_actual
 
+    # 1) Si hay un ZIP ya convertido y pendiente de descarga, NO volver a convertir
+    if st.session_state.pending_download is not None:
+        pendiente = st.session_state.pending_download
+
+        zip_bytes = pendiente["zip_bytes"]
+        zip_name = pendiente["zip_name"]
+        total_paginas = pendiente["total_paginas"]
+        dpi = pendiente["dpi"]
+        jpg_quality = pendiente["jpg_quality"]
+        perfil_usado = pendiente["perfil_usado"]
+        tamano_zip_mb = pendiente["tamano_mb"]
+        historial = pendiente["historial"]
+        file_index = pendiente["file_index"]
+        pdf_name = pendiente["pdf_name"]
+        file_id = pendiente["file_id"]
+
+        st.info(f"Preparando descarga de: {pdf_name}")
+
+        st.success(f"Conversión completada: {pdf_name}")
+        st.caption(
+            f"Páginas: {total_paginas} | Ajuste usado: {perfil_usado} | "
+            f"Resolución: {dpi} DPI | Calidad JPG: {jpg_quality} | "
+            f"Tamaño ZIP: {tamano_zip_mb:.2f} MB"
+        )
+
+        if len(historial) > 1:
+            st.write("### Historial de ajustes")
+            for intento in historial:
+                st.write(
+                    f"- {intento['etiqueta']} | "
+                    f"{intento['dpi']} DPI | JPG {intento['jpg_quality']} | "
+                    f"{intento['tamano_mb']:.2f} MB"
+                )
+
+        render_descarga_nativa_y_autoclick(zip_bytes, zip_name, file_index)
+
+        # Marcar como procesado ANTES de esperar/rerun
+        st.session_state.procesados.add(file_id)
+        st.session_state.ultima_calidad_usada[pdf_name] = (
+            f"{perfil_usado} | {dpi} DPI | JPG {jpg_quality}"
+        )
+
+        st.caption(
+            f"Descarga automática enviada. Esperando {WAIT_SECONDS} segundos antes de continuar..."
+        )
+
+        time.sleep(WAIT_SECONDS)
+
+        limpiar_memoria_objetos(zip_bytes)
+        st.session_state.pending_download = None
+        st.session_state.indice_actual = file_index + 1
+        gc.collect()
+        st.rerun()
+
+    # 2) Si no hay descarga pendiente, buscar el siguiente archivo NO procesado
     if st.session_state.proceso_activo:
-        if indice_actual < total_archivos:
+        while st.session_state.indice_actual < total_archivos:
+            pdf_file = uploaded_files[st.session_state.indice_actual]
+            file_id = obtener_id_archivo(pdf_file)
+
+            if file_id in st.session_state.procesados:
+                st.session_state.indice_actual += 1
+            else:
+                break
+
+        if st.session_state.indice_actual < total_archivos:
+            indice_actual = st.session_state.indice_actual
             pdf_file = uploaded_files[indice_actual]
+            file_id = obtener_id_archivo(pdf_file)
 
             st.info(f"Procesando archivo {indice_actual + 1} de {total_archivos}: {pdf_file.name}")
 
@@ -354,26 +435,7 @@ if uploaded_files:
                 jpg_quality = resultado["jpg_quality"]
                 perfil_usado = resultado["perfil_usado"]
                 tamano_zip_mb = resultado["tamano_mb"]
-
-                st.session_state.ultima_calidad_usada[pdf_file.name] = (
-                    f"{perfil_usado} | {dpi} DPI | JPG {jpg_quality}"
-                )
-
-                st.success(f"Conversión completada: {pdf_file.name}")
-                st.caption(
-                    f"Páginas: {total_paginas} | Ajuste usado: {perfil_usado} | "
-                    f"Resolución: {dpi} DPI | Calidad JPG: {jpg_quality} | "
-                    f"Tamaño ZIP: {tamano_zip_mb:.2f} MB"
-                )
-
-                if len(resultado["historial"]) > 1:
-                    st.write("### Historial de ajustes")
-                    for intento in resultado["historial"]:
-                        st.write(
-                            f"- {intento['etiqueta']} | "
-                            f"{intento['dpi']} DPI | JPG {intento['jpg_quality']} | "
-                            f"{intento['tamano_mb']:.2f} MB"
-                        )
+                historial = resultado["historial"]
 
                 if tamano_zip_mb >= MAX_STREAMLIT_MB:
                     st.error(
@@ -384,36 +446,28 @@ if uploaded_files:
                         f"Proceso detenido: {pdf_file.name} aún supera el límite de {MAX_STREAMLIT_MB} MB."
                     )
                 else:
-                    render_descarga_nativa_y_autoclick(zip_bytes, zip_name, indice_actual)
-
-                    st.caption(
-                        f"Descarga automática enviada. Esperando {WAIT_SECONDS} segundos antes de continuar..."
-                    )
-
-                    time.sleep(WAIT_SECONDS)
-
-                    limpiar_memoria_objetos(zip_bytes)
-
-                    try:
-                        pdf_file.close()
-                    except Exception:
-                        pass
-
+                    # Guardar el resultado para descargarlo en la siguiente ejecución
+                    st.session_state.pending_download = {
+                        "zip_bytes": zip_bytes,
+                        "zip_name": zip_name,
+                        "total_paginas": total_paginas,
+                        "dpi": dpi,
+                        "jpg_quality": jpg_quality,
+                        "perfil_usado": perfil_usado,
+                        "tamano_zip_mb": tamano_zip_mb,
+                        "tamano_mb": tamano_zip_mb,
+                        "historial": historial,
+                        "file_index": indice_actual,
+                        "pdf_name": pdf_file.name,
+                        "file_id": file_id,
+                    }
                     gc.collect()
-
-                    st.session_state.indice_actual += 1
-
-                    if st.session_state.indice_actual >= total_archivos:
-                        st.session_state.proceso_activo = False
-                        st.session_state.mensaje_final = "Todos los archivos fueron procesados."
-                    else:
-                        st.rerun()
+                    st.rerun()
 
             except Exception as e:
                 st.session_state.proceso_activo = False
                 st.error(f"No se pudo procesar {pdf_file.name}: {e}")
                 gc.collect()
-
         else:
             st.session_state.proceso_activo = False
             st.session_state.mensaje_final = "Todos los archivos fueron procesados."
@@ -427,7 +481,7 @@ if uploaded_files:
     if st.session_state.mensaje_final:
         st.success(st.session_state.mensaje_final)
 
-    restantes = max(total_archivos - st.session_state.indice_actual, 0)
+    restantes = max(total_archivos - len(st.session_state.procesados), 0)
     st.write(f"Pendientes: {restantes}")
 
     if st.session_state.ultima_calidad_usada:
