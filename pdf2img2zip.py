@@ -6,7 +6,9 @@ import zipfile
 import os
 import gc
 import time
+import re
 import json
+import streamlit.components.v1 as components
 from typing import Tuple, Optional, Dict, Any
 
 # ----------------------------
@@ -77,6 +79,13 @@ uploaded_files = st.file_uploader(
 # ----------------------------
 # FUNCIONES
 # ----------------------------
+def sanitizar_key_css(texto: str) -> str:
+    """
+    Convierte una key en algo seguro para usar en selector CSS.
+    Streamlit usa la key como clase CSS con prefijo st-key-.
+    """
+    return re.sub(r"[^a-zA-Z0-9_-]", "-", texto)
+
 def limpiar_nombre_archivo(nombre: str) -> str:
     base = os.path.splitext(nombre)[0]
     return base.strip()
@@ -262,47 +271,59 @@ def convertir_pdf_con_ajuste_automatico(pdf_file, perfil_inicial) -> Dict[str, A
 
 def render_descarga_nativa_y_autoclick(zip_bytes: bytes, zip_name: str, file_index: int):
     """
-    Usa st.download_button para la transferencia real.
-    Usa st.html con JavaScript para hacer clic automático en el botón.
+    1) Renderiza un botón nativo visible.
+    2) Lanza clic automático por JS sobre ese mismo botón.
+    3) on_click='ignore' evita rerun por el clic de descarga.
     """
-    label = f"Descargar {zip_name}"
-    button_key = f"download_btn_{file_index}_{zip_name}"
+    button_key_raw = f"download_btn_{file_index}_{zip_name}"
+    button_key = sanitizar_key_css(button_key_raw)
 
+    # Botón VISIBLE como respaldo
     st.download_button(
-        label=label,
+        label=f"Descargar {zip_name}",
         data=zip_bytes,
         file_name=zip_name,
         mime="application/zip",
         key=button_key,
-        on_click="ignore",  # evita rerun al hacer clic
+        on_click="ignore",
     )
 
-    autoclick_id = f"autoclick_{file_index}_{zip_name}"
+    autoclick_id = f"autoclick_{button_key}"
+
     if st.session_state.ultimo_autoclick_id != autoclick_id:
         st.session_state.ultimo_autoclick_id = autoclick_id
 
-        label_js = json.dumps(label)
+        selector = f".st-key-{button_key} button"
+        selector_js = json.dumps(selector)
 
-        js = f"""
+        html = f"""
+        <html>
+        <body>
         <script>
-        const targetText = {label_js};
+        const selector = {selector_js};
 
-        function findAndClickButton() {{
-            const buttons = Array.from(window.parent.document.querySelectorAll("button"));
-            const target = buttons.find(btn => (btn.innerText || "").trim() === targetText);
+        function clickWhenReady() {{
+            try {{
+                const doc = window.parent.document;
+                const btn = doc.querySelector(selector);
 
-            if (target) {{
-                target.click();
-            }} else {{
-                setTimeout(findAndClickButton, 250);
+                if (btn) {{
+                    btn.click();
+                }} else {{
+                    setTimeout(clickWhenReady, 250);
+                }}
+            }} catch (e) {{
+                setTimeout(clickWhenReady, 400);
             }}
         }}
 
-        setTimeout(findAndClickButton, 300);
+        setTimeout(clickWhenReady, 400);
         </script>
+        </body>
+        </html>
         """
 
-        st.html(js, unsafe_allow_javascript=True)
+        components.html(html, height=0, width=0)
 
 
 def limpiar_memoria_objetos(*objetos):
