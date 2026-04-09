@@ -1,12 +1,13 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import fitz  # PyMuPDF
 from PIL import Image
 import io
 import zipfile
 import os
-import base64
 import gc
 import time
+import json
 from typing import Tuple, Optional, Dict, Any
 
 # ----------------------------
@@ -51,6 +52,9 @@ if "ultima_calidad_usada" not in st.session_state:
 
 if "lote_actual" not in st.session_state:
     st.session_state.lote_actual = None
+
+if "ultimo_autoclick_id" not in st.session_state:
+    st.session_state.ultimo_autoclick_id = None
 
 # ----------------------------
 # OPCIONES DE EXPORTACIÓN
@@ -295,24 +299,56 @@ def convertir_pdf_con_ajuste_automatico(pdf_file, perfil_inicial) -> Dict[str, A
     return ultimo_resultado
 
 
-def generar_html_descarga_automatica(zip_bytes: bytes, zip_name: str) -> str:
-    b64 = base64.b64encode(zip_bytes).decode()
-    html = f"""
-    <html>
-    <body>
-        <a id="descarga_zip" href="data:application/zip;base64,{b64}" download="{zip_name}"></a>
-        <script>
-            window.onload = function() {{
-                const link = document.getElementById('descarga_zip');
-                if (link) {{
-                    link.click();
-                }}
-            }}
-        </script>
-    </body>
-    </html>
+def render_descarga_nativa_y_autoclick(zip_bytes: bytes, zip_name: str, file_index: int):
     """
-    return html
+    Usa st.download_button para la transferencia real del archivo.
+    Luego usa un pequeño script en components.html para hacer click automático
+    sobre ese botón nativo. Así evitamos convertir el ZIP a base64.
+    """
+    label = f"Descargar {zip_name}"
+    button_key = f"download_btn_{file_index}_{zip_name}"
+
+    st.download_button(
+        label=label,
+        data=zip_bytes,
+        file_name=zip_name,
+        mime="application/zip",
+        key=button_key,
+    )
+
+    autoclick_id = f"autoclick_{file_index}_{zip_name}"
+    if st.session_state.ultimo_autoclick_id != autoclick_id:
+        st.session_state.ultimo_autoclick_id = autoclick_id
+
+        label_js = json.dumps(label)
+        html = f"""
+        <html>
+        <body>
+        <script>
+        const targetText = {label_js};
+
+        function findAndClickButton() {{
+            try {{
+                const parentDoc = window.parent.document;
+                const buttons = Array.from(parentDoc.querySelectorAll("button"));
+                const target = buttons.find(btn => (btn.innerText || "").trim() === targetText);
+
+                if (target) {{
+                    target.click();
+                }} else {{
+                    setTimeout(findAndClickButton, 300);
+                }}
+            }} catch (e) {{
+                setTimeout(findAndClickButton, 500);
+            }}
+        }}
+
+        setTimeout(findAndClickButton, 500);
+        </script>
+        </body>
+        </html>
+        """
+        components.html(html, height=0, width=0)
 
 
 def limpiar_memoria_objetos(*objetos):
@@ -341,6 +377,7 @@ if uploaded_files:
         st.session_state.indice_actual = 0
         st.session_state.mensaje_final = ""
         st.session_state.ultima_calidad_usada = {}
+        st.session_state.ultimo_autoclick_id = None
         st.rerun()
 
 # ----------------------------
@@ -399,13 +436,11 @@ if uploaded_files:
                         f"Proceso detenido: {pdf_file.name} aún supera el límite de {MAX_STREAMLIT_MB} MB."
                     )
                 else:
-                    st.components.v1.html(
-                        generar_html_descarga_automatica(zip_bytes, zip_name),
-                        height=0
-                    )
+                    render_descarga_nativa_y_autoclick(zip_bytes, zip_name, indice_actual)
 
                     st.caption(
-                        f"Descarga automática enviada. Esperando {WAIT_SECONDS} segundos antes de continuar..."
+                        f"Descarga automática enviada con el botón nativo de Streamlit. "
+                        f"Esperando {WAIT_SECONDS} segundos antes de continuar..."
                     )
 
                     time.sleep(WAIT_SECONDS)
