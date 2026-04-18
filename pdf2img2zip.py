@@ -86,6 +86,7 @@ def sanitizar_key_css(texto: str) -> str:
     """
     return re.sub(r"[^a-zA-Z0-9_-]", "-", texto)
 
+
 def limpiar_nombre_archivo(nombre: str) -> str:
     base = os.path.splitext(nombre)[0]
     return base.strip()
@@ -350,6 +351,7 @@ def reiniciar_lote():
     st.session_state.procesados = set()
     st.session_state.pending_download = None
 
+
 # ----------------------------
 # INICIO AUTOMÁTICO DEL PROCESO
 # ----------------------------
@@ -360,6 +362,7 @@ if uploaded_files:
         st.session_state.lote_actual = firma_lote
         reiniciar_lote()
         st.rerun()
+
 
 # ----------------------------
 # PROCESAMIENTO UNO POR UNO
@@ -463,7 +466,6 @@ if uploaded_files:
                         f"Proceso detenido: {pdf_file.name} aún supera el límite de {MAX_STREAMLIT_MB} MB."
                     )
                 else:
-                    # Guardar el resultado para descargarlo en la siguiente ejecución
                     st.session_state.pending_download = {
                         "zip_bytes": zip_bytes,
                         "zip_name": zip_name,
@@ -480,10 +482,10 @@ if uploaded_files:
                     gc.collect()
                     st.rerun()
 
-        except Exception as e:
-            st.session_state.proceso_activo = False
-            st.error(f"Error procesando {pdf_file.name}: {e}")
-            st.session_state.mensaje_final = f"Proceso detenido por error en {pdf_file.name}."
+            except Exception as e:
+                st.session_state.proceso_activo = False
+                st.error(f"Error procesando {pdf_file.name}: {e}")
+                st.session_state.mensaje_final = f"Proceso detenido por error en {pdf_file.name}."
         else:
             st.session_state.proceso_activo = False
             st.session_state.mensaje_final = "Todos los archivos fueron procesados."
