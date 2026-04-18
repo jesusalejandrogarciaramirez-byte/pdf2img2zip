@@ -480,11 +480,10 @@ if uploaded_files:
                     gc.collect()
                     st.rerun()
 
-            except Exception as e:
-                st.session_state.proceso_activo = False
-                st.error(
-                    f"El ZIP final quedó en {tamano_zip_mb:.2f} MB y todavía rebasa el límite de Streamlit."
-                )
+        except Exception as e:
+            st.session_state.proceso_activo = False
+            st.error(f"Error procesando {pdf_file.name}: {e}")
+            st.session_state.mensaje_final = f"Proceso detenido por error en {pdf_file.name}."
         else:
             st.session_state.proceso_activo = False
             st.session_state.mensaje_final = "Todos los archivos fueron procesados."
