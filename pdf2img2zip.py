@@ -16,18 +16,16 @@ import tempfile
 import threading
 import time
 import unicodedata
-from urllib.parse import quote
 import uuid
 import zipfile
 
-APP_DIR = Path(__file__).resolve().parent
-STATIC_DIR = APP_DIR / "static"
-DOWNLOADS_DIR = STATIC_DIR / "descargas"
+DOWNLOADS_DIR = Path(tempfile.gettempdir()) / "pdfzip_descargas"
 MAX_ZIP_BYTES = 195 * 1024 * 1024
+DOWNLOAD_CHUNK_BYTES = 4 * 1024 * 1024
 MAX_PAGE_PIXELS = 24_000_000
 MAX_WORKER_RSS = 512 * 1024 * 1024
 WORKER_STALL_SECONDS = 300
-SESSION_SCHEMA = 2
+SESSION_SCHEMA = 3
 PROFILES = {
     "Alta": (300, 92),
     "Media alta": (200, 88),
@@ -353,180 +351,316 @@ def ejecutar_conversion(archivo, output_dir: Path, nombre_base: str, perfil: str
             shutil.rmtree(output_dir, ignore_errors=True)
 
 
-def _static_url(path: Path, base_path: str = "") -> str:
-    relative = path.resolve().relative_to(STATIC_DIR.resolve())
-    # La ruta pertenece al backend, no a la raíz del portal de Community Cloud.
-    # El navegador conserva su prefijo real (/~/+/ en Cloud) al resolverla.
-    return "app/static/" + "/".join(quote(part, safe="") for part in relative.parts)
+def construir_mensaje_descarga(parts, batch: str, request=None, enabled: bool = True) -> bytes:
+    """Entrega como máximo un bloque del ZIP, identificado por sesión/lote/archivo.
+
+    El cliente sólo puede pedir IDs publicados en este lote, nunca una ruta. Cada
+    petición confirma el bloque anterior; no se conserva el ZIP completo en RAM.
+    """
+    metadata = {"protocol": 3, "batch": batch, "enabled": bool(enabled),
+                "files": [{"id": p["id"], "name": p["file_name"], "size": p["size_bytes"]} for p in parts],
+                "response": None, "error": None}
+    payload = b""
+    if enabled and isinstance(request, dict) and request.get("batch") == batch:
+        file_id, token, offset = request.get("id"), request.get("token"), request.get("offset")
+        try:
+            if (not isinstance(file_id, str) or not isinstance(token, str)
+                    or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", token)
+                    or type(offset) is not int or offset < 0 or offset % DOWNLOAD_CHUNK_BYTES):
+                raise ConversionError("Solicitud de descarga no válida. Pulsa Reintentar descarga.")
+            part = next((p for p in parts if p["id"] == file_id), None)
+            if part is None:
+                raise ConversionError("El archivo ya no pertenece a este lote. Vuelve a procesarlo.")
+            path, total = Path(part["path"]), part["size_bytes"]
+            if offset >= total or path.stat().st_size != total:
+                raise ConversionError("El ZIP cambió o quedó incompleto. Vuelve a procesar este PDF.")
+            with path.open("rb") as source:
+                if offset == 0:
+                    if source.read(4) != b"PK\x03\x04" or not zipfile.is_zipfile(source):
+                        raise ConversionError("El resultado no es un ZIP válido. Vuelve a procesar este PDF.")
+                source.seek(offset)
+                payload = source.read(min(DOWNLOAD_CHUNK_BYTES, total - offset))
+            if len(payload) != min(DOWNLOAD_CHUNK_BYTES, total - offset):
+                raise ConversionError("No se pudo leer el ZIP completo. Vuelve a procesar este PDF.")
+            metadata["response"] = {"id": file_id, "token": token, "offset": offset,
+                                    "size": len(payload), "total": total,
+                                    "last": offset + len(payload) == total}
+        except (ConversionError, OSError) as exc:
+            payload = b""
+            metadata["error"] = {"id": file_id, "token": token,
+                                 "message": str(exc) if isinstance(exc, ConversionError) else
+                                 "El archivo temporal no está disponible. Vuelve a procesar este PDF."}
+    header = json.dumps(metadata, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return len(header).to_bytes(4, "big") + header + payload
 
 
-def leer_zip_validado(path: Path, expected_size: int) -> bytes:
-    """Respaldo diferido nativo: nunca presentar HTML o un archivo parcial como ZIP."""
-    if path.stat().st_size != expected_size:
-        raise ConversionError("El ZIP cambió o quedó incompleto. Vuelve a procesar este PDF.")
-    with path.open("rb") as source:
-        if source.read(4) != b"PK\x03\x04":
-            raise ConversionError("El resultado no es un ZIP válido. Vuelve a procesar este PDF.")
-    if not zipfile.is_zipfile(path):
-        raise ConversionError("No se pudo validar el directorio del ZIP.")
-    return path.read_bytes()
-
-
-# La cola vive en la ventana principal: un rerun no cancela una descarga en curso.
-# Sólo recibe metadatos; ningún ZIP se codifica en base64 ni viaja por el websocket.
-DOWNLOAD_JS = r"""
-(() => {
-  if (window.__pdfzipDownloads?.version === 2) return;
-  window.__pdfzipDownloads?.cancel?.();
-  const states = new Map(), sent = new Set(), pending = [];
-  let wanted = new Set(), active = null, running = false;
-  const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
-  function backendUrl(relative) {
-    // La configuración la inyecta Streamlit. Si no existe, usamos la ventana
-    // de la propia app: en Cloud es /~/+/, no el portal que la contiene.
-    const configured = window.__streamlit?.BACKEND_BASE_URL;
-    const base = new URL(configured || window.location.href, window.location.href);
-    if (!['http:', 'https:'].includes(base.protocol)) throw new Error('Backend no válido');
-    base.search = ''; base.hash = '';
-    if (!base.pathname.endsWith('/')) base.pathname += '/';
-    return new URL(relative, base);
-  }
-  async function nativeDownload(file, signal) {
-    const selector = '.st-key-native_' + file.id;
-    const deadline = Date.now() + 90000;
-    let started = false, busySeen = false, observed = null, observer = null;
-    try {
-      while (Date.now() < deadline) {
-        if (signal.aborted || !wanted.has(file.id)) throw new DOMException('Cancelado', 'AbortError');
-        const wrapper = document.querySelector(selector);
-        const button = wrapper?.querySelector('button');
-        if (wrapper?.querySelector('[data-testid="stDownloadButtonError"]')) throw new Error('Falló la descarga nativa');
-        if (button && observed !== button) {
-          observer?.disconnect(); observed = button;
-          observer = new MutationObserver(records => {
-            if (records.some(record => record.attributeName === 'disabled' && record.oldValue === null)) busySeen = true;
-          });
-          observer.observe(button, {attributes: true, attributeFilter: ['disabled'], attributeOldValue: true});
-        }
-        if (button && !started && !button.disabled) {
-          button.click(); started = true;
-          states.set(file.id, 'native');
-        } else if (started && button) {
-          if (button.disabled) busySeen = true;
-          if (busySeen && !button.disabled) return;
-        }
-        await wait(100);
-      }
-      throw new Error('La descarga nativa no confirmó su preparación');
-    } finally { observer?.disconnect(); }
-  }
-  const alreadySent = id => {
-    try { return sent.has(id) || sessionStorage.getItem('pdfzip:' + id) === 'sent'; }
-    catch (_) { return sent.has(id); }
-  };
-  async function run() {
-    if (running) return;
-    running = true;
-    try {
-      while (pending.length) {
-        const file = pending.shift();
-        if (!wanted.has(file.id) || alreadySent(file.id)) continue;
-        const controller = new AbortController();
-        active = {id: file.id, controller};
-        let objectUrl = null;
-        try {
-          states.set(file.id, 'loading');
-          try {
-            if (!file.useStatic) throw new Error('Usar transporte nativo');
-            const url = backendUrl(file.url);
-            const response = await fetch(url.href, {signal: controller.signal, cache: 'no-store', credentials: 'same-origin'});
-            if (!response.ok) throw new Error('HTTP ' + response.status);
-            if ((response.headers.get('content-type') || '').toLowerCase().includes('text/html')) throw new Error('El servidor devolvió HTML');
-            const blob = await response.blob();
-            if (blob.size !== file.size) throw new Error('Tamaño incompleto');
-            const magic = new Uint8Array(await blob.slice(0, 4).arrayBuffer());
-            if (magic[0] !== 80 || magic[1] !== 75 || magic[2] !== 3 || magic[3] !== 4) throw new Error('El archivo no es un ZIP');
-            if (!wanted.has(file.id) || controller.signal.aborted) continue;
-            objectUrl = URL.createObjectURL(blob);
-            const link = document.createElement('a');
-            link.href = objectUrl;
-            link.download = file.name;
-            link.style.display = 'none';
-            document.body.appendChild(link);
-            link.click();
-            link.remove();
-          } catch (error) {
-            if (error.name === 'AbortError' || controller.signal.aborted || !wanted.has(file.id)) throw error;
-            // Streamlit resuelve su /media y el origen de descargas. Este botón
-            // permanece renderizado y también sirve como respaldo manual.
-            await nativeDownload(file, controller.signal);
-          }
-          sent.add(file.id);
-          try { sessionStorage.setItem('pdfzip:' + file.id, 'sent'); } catch (_) {}
-          states.set(file.id, 'sent');
-          await wait(1000);
-        } catch (error) {
-          states.set(file.id, error.name === 'AbortError' ? 'cancelled' : 'error');
-        } finally {
-          if (objectUrl) URL.revokeObjectURL(objectUrl);
-          active = null;
-        }
-      }
-    } finally { running = false; }
-  }
-  window.__pdfzipDownloads = {
-    version: 2,
-    cancel() { wanted = new Set(); pending.length = 0; active?.controller.abort(); },
-    enqueue(files) {
-      wanted = new Set(files.map(file => file.id));
-      for (let i = pending.length - 1; i >= 0; i--) if (!wanted.has(pending[i].id)) pending.splice(i, 1);
-      if (active && !wanted.has(active.id)) active.controller.abort();
-      for (const file of files) {
-        if (alreadySent(file.id)) { states.set(file.id, 'sent'); continue; }
-        if (active && active.id === file.id || pending.some(item => item.id === file.id)) continue;
-        pending.push(file);
-        states.set(file.id, 'queued');
-      }
-      run();
-    },
-    status(ids) { return ids.map(id => states.get(id) || 'queued'); }
-  };
-})();
+DOWNLOAD_CSS = """
+.downloads {font: inherit; color: inherit;}
+.summary {font-size: .9rem; margin: .5rem 0 1rem;}
+.file {border: 1px solid #8885; border-radius: .6rem; padding: .8rem; margin: .7rem 0;}
+.name {font-weight: 600; overflow-wrap: anywhere;}
+.status {font-size: .85rem; opacity: .8; margin: .35rem 0 .6rem;}
+.action {display: inline-flex; font: inherit; font-size: .95rem; padding: .4rem .7rem;
+  border: 1px solid #8888; border-radius: .45rem; background: transparent; color: inherit;
+  text-decoration: none; cursor: pointer; overflow-wrap: anywhere;}
+.action:hover {border-color: #f36; color: #f36;}
+.action:focus-visible {outline: 2px solid #f36; outline-offset: 2px;}
+[hidden] {display: none !important;}
+progress {width: 100%; height: .5rem; accent-color: #f36;}
 """
 
 
-def emitir_descargas(st, parts):
-    files = [{"id": p["id"], "url": _static_url(Path(p["path"])),
-              "name": p["file_name"], "size": p["size_bytes"],
-              "useStatic": bool(st.get_option("server.enableStaticServing"))} for p in parts]
-    encoded = json.dumps(files, ensure_ascii=True).replace("<", "\\u003c")
-    script = json.dumps(DOWNLOAD_JS).replace("<", "\\u003c")
-    frame = """<!doctype html><html lang="es"><meta charset="utf-8"><body style="margin:0;font:13px system-ui;color:#666">
-<div id="estado" role="status" aria-live="polite"></div><script>
-const files = __FILES__;
-try {
-  const owner = window.parent;
-  if (owner.__pdfzipDownloads?.version !== 2) {
-    const script = owner.document.createElement('script');
-    script.textContent = __SCRIPT__;
-    owner.document.head.appendChild(script);
-    script.remove();
+# Componente oficial v2: los bytes viajan por bloques por la conexión de la app.
+# El navegador conserva un Blob y un enlace real; no hay rutas /media, estáticos,
+# base64, clics sobre widgets ajenos ni acceso al DOM de la ventana superior.
+DOWNLOAD_JS = r"""
+const CACHE_BYTES = 256 * 1024 * 1024;
+const MAX_CHUNK = 4 * 1024 * 1024;
+const WAIT_MS = 60000;
+
+function decode(data) {
+  const bytes = data instanceof Uint8Array ? data : new Uint8Array(data);
+  if (bytes.byteLength < 4) throw new Error('Mensaje de descarga incompleto.');
+  const length = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(0, false);
+  if (length < 2 || length > bytes.byteLength - 4) throw new Error('Cabecera de descarga incompleta.');
+  const meta = JSON.parse(new TextDecoder().decode(bytes.subarray(4, 4 + length)));
+  if (meta.protocol !== 3 || typeof meta.batch !== 'string' || !Array.isArray(meta.files))
+    throw new Error('Formato de descarga no compatible. Recarga la página.');
+  return {meta, chunk: bytes.subarray(4 + length)};
+}
+
+function createState(root, batch) {
+  root.querySelector('[data-pdfzip-error]')?.remove();
+  const area = document.createElement('section');
+  area.className = 'downloads';
+  area.setAttribute('aria-label', 'Descargas');
+  const summary = document.createElement('div');
+  summary.className = 'summary';
+  summary.setAttribute('role', 'status');
+  summary.setAttribute('aria-live', 'polite');
+  area.appendChild(summary);
+  root.appendChild(area);
+  const s = {root, batch, area, summary, records: new Map(), order: [], enabled: false,
+    active: null, inflight: null, timer: null, counter: 0, disposed: false,
+    emit: null, lastRequest: null};
+
+  function sentBefore(id) {
+    try { return sessionStorage.getItem('pdfzip3:' + batch + ':' + id) === 'sent'; }
+    catch (_) { return false; }
   }
-  owner.__pdfzipDownloads.enqueue(files);
-  function update() {
-    const states = owner.__pdfzipDownloads.status(files.map(f => f.id));
-    const sent = states.filter(s => s === 'sent').length;
-    const failed = states.filter(s => s === 'error').length;
-    document.getElementById('estado').textContent = !files.length ? '' : failed
-      ? 'No se pudo iniciar alguna descarga. Usa los botones de descarga de abajo.'
-      : sent < files.length ? 'Preparando descargas automáticas: ' + sent + ' de ' + files.length
-      : 'Descargas solicitadas al navegador: ' + sent + '. Los botones de respaldo siguen disponibles.';
+  function remember(rec) {
+    rec.sent = true;
+    try { sessionStorage.setItem('pdfzip3:' + batch + ':' + rec.id, 'sent'); } catch (_) {}
   }
-  update(); const timer = setInterval(update, 500);
-  window.addEventListener('pagehide', () => clearInterval(timer));
-} catch (_) { document.getElementById('estado').textContent = 'Usa los botones de descarga de abajo.'; }
-</script></body></html>""".replace("__FILES__", encoded).replace("__SCRIPT__", script)
-    st.iframe(frame, height=48 if parts else 1)
+  function release(rec) {
+    if (rec.url) {
+      const url = rec.url;
+      // Una descarga recién solicitada necesita conservar su URL al iniciarse.
+      if (Date.now() - rec.lastUsed < 2000) setTimeout(() => URL.revokeObjectURL(url), 2000);
+      else URL.revokeObjectURL(url);
+      rec.url = null;
+    }
+    rec.chunks = [];
+  }
+  function clearWait() { clearTimeout(s.timer); s.timer = null; }
+  function emit(value) { s.lastRequest = value; s.emit(value); }
+  function render(rec) {
+    const ready = rec.phase === 'ready';
+    rec.link.hidden = !ready;
+    if (ready) rec.link.href = rec.url;
+    else rec.link.removeAttribute('href');
+    rec.retry.hidden = !['error', 'evicted'].includes(rec.phase);
+    rec.retry.textContent = rec.phase === 'error' ? 'Reintentar descarga' : 'Descargar ' + rec.name;
+    rec.bar.hidden = rec.phase !== 'loading';
+    rec.bar.max = rec.size;
+    rec.bar.value = rec.offset;
+    let text;
+    if (rec.phase === 'error') text = rec.error;
+    else if (rec.phase === 'evicted') text = 'Pulsa Descargar para volver a preparar este archivo.';
+    else if (ready) text = rec.sent ? 'Descarga solicitada al navegador. Puedes descargarlo de nuevo.' : 'Archivo listo para descargar.';
+    else if (!s.enabled) text = 'Se preparará al terminar la conversión del lote.';
+    else if (rec.phase === 'loading') text = 'Preparando descarga: ' + Math.floor(100 * rec.offset / rec.size) + '%';
+    else text = 'En espera para preparar la descarga.';
+    rec.status.textContent = (rec.size / 1048576).toFixed(2) + ' MiB · ' + text;
+  }
+  function renderSummary() {
+    const records = [...s.records.values()];
+    s.area.hidden = records.length === 0;
+    const failed = records.filter(rec => rec.phase === 'error').length;
+    const sent = records.filter(rec => rec.sent).length;
+    s.summary.textContent = !s.enabled ? 'Los ZIP se prepararán al terminar la conversión del lote.'
+      : failed ? 'No se pudo preparar ' + failed + ' archivo(s). Puedes reintentar su descarga.'
+      : sent < records.length ? 'Preparando las descargas automáticas: ' + sent + ' de ' + records.length
+      : 'Descargas solicitadas al navegador: ' + sent + '. Los archivos siguen disponibles debajo.';
+  }
+  function fail(rec, message) {
+    clearWait();
+    release(rec);
+    rec.phase = 'error'; rec.error = message; rec.offset = 0;
+    s.inflight = null; s.active = null;
+    render(rec); renderSummary();
+  }
+  function reserve(size) {
+    let cached = [...s.records.values()].filter(rec => rec.phase === 'ready');
+    let total = cached.reduce((sum, rec) => sum + rec.size, 0);
+    cached.sort((a, b) => a.lastUsed - b.lastUsed);
+    for (const rec of cached) {
+      if (total + size <= CACHE_BYTES) break;
+      total -= rec.size;
+      release(rec); rec.phase = 'evicted'; rec.offset = 0;
+      render(rec);
+    }
+  }
+  s.pump = () => {
+    if (s.disposed || !s.enabled || s.inflight) return;
+    let rec = s.active ? s.records.get(s.active) : null;
+    if (!rec) rec = s.order.map(id => s.records.get(id)).find(item => item.phase === 'waiting');
+    if (!rec) {
+      if (s.lastRequest !== null) emit(null); // Libera también el último bloque del mensaje de Streamlit.
+      renderSummary();
+      return;
+    }
+    if (rec.phase === 'waiting') {
+      reserve(rec.size);
+      rec.chunks = []; rec.offset = 0; rec.phase = 'loading';
+    }
+    s.active = rec.id;
+    const request = {batch, id: rec.id, offset: rec.offset, token: Date.now() + '-' + (++s.counter)};
+    s.inflight = request;
+    render(rec); renderSummary();
+    emit(request);
+    s.timer = setTimeout(() => {
+      if (s.disposed || s.inflight?.token !== request.token) return;
+      fail(rec, 'La transferencia no respondió. Comprueba la conexión y pulsa Reintentar descarga.');
+      s.pump();
+    }, WAIT_MS);
+  };
+  s.update = meta => {
+    const ids = new Set(meta.files.map(file => file.id));
+    for (const [id, rec] of s.records) {
+      if (ids.has(id)) continue;
+      if (s.active === id) { clearWait(); s.inflight = null; s.active = null; }
+      release(rec); rec.row.remove(); s.records.delete(id);
+    }
+    s.order = meta.files.map(file => file.id);
+    s.enabled = !!meta.enabled;
+    if (!s.enabled) { clearWait(); s.inflight = null; }
+    for (const file of meta.files) {
+      if (!s.records.has(file.id)) {
+        const row = document.createElement('div'); row.className = 'file';
+        const name = document.createElement('div'); name.className = 'name'; name.textContent = file.name;
+        const status = document.createElement('div'); status.className = 'status';
+        const bar = document.createElement('progress'); bar.setAttribute('aria-label', 'Preparación de ' + file.name);
+        const link = document.createElement('a'); link.className = 'action';
+        link.download = file.name; link.textContent = 'Descargar ' + file.name;
+        const retry = document.createElement('button'); retry.className = 'action'; retry.type = 'button';
+        row.append(name, status, bar, link, retry); area.appendChild(row);
+        const rec = {id: file.id, name: file.name, size: file.size, row, status, bar, link, retry,
+          phase: 'waiting', chunks: [], offset: 0, url: null, lastUsed: 0,
+          sent: sentBefore(file.id), manual: false, error: ''};
+        link.addEventListener('click', () => { rec.lastUsed = Date.now(); remember(rec); render(rec); renderSummary(); });
+        retry.addEventListener('click', () => {
+          rec.phase = 'waiting'; rec.error = ''; rec.manual = true;
+          render(rec); s.pump();
+        });
+        s.records.set(file.id, rec);
+      }
+      render(s.records.get(file.id));
+    }
+    renderSummary();
+  };
+  s.consume = (meta, chunk) => {
+    if (!s.enabled || !s.inflight) return;
+    const answer = meta.error || meta.response;
+    const request = s.inflight;
+    if (!answer || answer.id !== request.id || answer.token !== request.token) return;
+    const rec = s.records.get(request.id);
+    if (!rec) return;
+    if (meta.error) { fail(rec, meta.error.message); return; }
+    if (answer.offset !== request.offset || answer.offset !== rec.offset) {
+      fail(rec, 'Se recibió un bloque fuera de orden. Pulsa Reintentar descarga.'); return;
+    }
+    if (answer.total !== rec.size || answer.size !== chunk.byteLength || chunk.byteLength === 0
+        || chunk.byteLength > MAX_CHUNK || rec.offset + chunk.byteLength > rec.size
+        || chunk.byteLength !== Math.min(MAX_CHUNK, rec.size - rec.offset)
+        || answer.last !== (rec.offset + chunk.byteLength === rec.size)) {
+      fail(rec, 'Se recibió una descarga incompleta. Pulsa Reintentar descarga.'); return;
+    }
+    if (rec.offset === 0 && (chunk[0] !== 80 || chunk[1] !== 75 || chunk[2] !== 3 || chunk[3] !== 4)) {
+      fail(rec, 'El resultado recibido no es un ZIP válido. Vuelve a procesar el PDF.'); return;
+    }
+    clearWait(); s.inflight = null;
+    rec.chunks.push(chunk.slice()); // Evita retener el buffer Protobuf completo.
+    rec.offset += chunk.byteLength;
+    if (rec.offset === rec.size) {
+      try {
+        const blob = new Blob(rec.chunks, {type: 'application/zip'});
+        rec.chunks = [];
+        rec.url = URL.createObjectURL(blob); rec.phase = 'ready'; rec.lastUsed = Date.now();
+        s.active = null;
+        render(rec);
+        if (!rec.sent || rec.manual) { rec.manual = false; rec.link.click(); }
+      } catch (_) { fail(rec, 'El navegador no pudo preparar el archivo. Pulsa Reintentar descarga.'); }
+    }
+    render(rec); renderSummary();
+  };
+  s.dispose = () => {
+    if (s.disposed) return;
+    s.disposed = true; clearWait();
+    for (const rec of s.records.values()) release(rec);
+    s.records.clear();
+    s.area.remove();
+    window.removeEventListener('pagehide', s.pagehide);
+  };
+  s.pagehide = event => { if (!event.persisted) s.dispose(); };
+  window.addEventListener('pagehide', s.pagehide);
+  return s;
+}
+
+export default function ({data, parentElement, setStateValue}) {
+  let decoded;
+  try { decoded = decode(data); }
+  catch (error) {
+    parentElement.__pdfzipDelivery?.dispose();
+    parentElement.querySelector('[data-pdfzip-error]')?.remove();
+    const message = document.createElement('p');
+    message.dataset.pdfzipError = 'true'; message.setAttribute('role', 'alert');
+    message.textContent = error.message;
+    parentElement.appendChild(message);
+    return;
+  }
+  const {meta, chunk} = decoded;
+  const retired = parentElement.__pdfzipRetiredBatches ||= new Set();
+  if (retired.has(meta.batch)) return;
+  let state = parentElement.__pdfzipDelivery;
+  if (!state || state.disposed || state.batch !== meta.batch) {
+    if (state && state.batch !== meta.batch) retired.add(state.batch);
+    state?.dispose();
+    state = createState(parentElement, meta.batch);
+    parentElement.__pdfzipDelivery = state;
+  }
+  state.emit = value => setStateValue('request', value);
+  state.update(meta);
+  state.consume(meta, chunk);
+  state.pump();
+  return () => {
+    // Los datos cambian con cada bloque. Sólo limpiar al desmontar realmente,
+    // sin revocar los enlaces listos durante una actualización de la pantalla.
+    setTimeout(() => {
+      if (parentElement.__pdfzipDelivery === state && !parentElement.isConnected) state.dispose();
+    }, 0);
+  };
+}
+"""
+
+
+def emitir_descargas(st, parts, enabled=True):
+    import streamlit.components.v2 as components
+    component = components.component("pdfzip_delivery_v3", html="", css=DOWNLOAD_CSS, js=DOWNLOAD_JS)
+    value = st.session_state.get("pdfzip_delivery")
+    request = value.get("request") if value is not None else None
+    message = construir_mensaje_descarga(parts, st.session_state.pdfzip_delivery_batch, request, enabled)
+    component(data=message, key="pdfzip_delivery", on_request_change=lambda: None)
 
 
 def _new_batch(st, signature):
@@ -536,6 +670,7 @@ def _new_batch(st, signature):
     DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
     st.session_state.pdfzip_temp = tempfile.TemporaryDirectory(prefix="s_", dir=DOWNLOADS_DIR)
     st.session_state.pdfzip_signature = signature
+    st.session_state.pdfzip_delivery_batch = uuid.uuid4().hex
     st.session_state.pdfzip_results = {}
     st.session_state.pdfzip_schema = SESSION_SCHEMA
     gc.collect()
@@ -556,16 +691,6 @@ def _render_result(st, result):
             st.info("Se usó el ajuste de emergencia (72 DPI, JPG 55) porque el primer ZIP superaba 195 MiB.")
         if len(result["parts"]) > 1:
             st.info(f"El resultado se dividió en {len(result['parts'])} ZIP independientes. Cada uno contiene páginas completas.")
-        for part in result["parts"]:
-            path = Path(part["path"])
-            if not path.is_file():
-                st.warning("Este archivo temporal ya no está disponible. Vuelve a procesar el lote.")
-            else:
-                expected_size = part["size_bytes"]
-                st.download_button(f"Descargar {part['file_name']}",
-                                   data=lambda path=path, size=expected_size: leer_zip_validado(path, size),
-                                   file_name=part["file_name"], mime="application/zip",
-                                   key="native_" + part["id"], on_click="ignore")
 
 
 def main():
@@ -588,30 +713,25 @@ def main():
     uploaded = st.file_uploader("Sube uno o varios archivos PDF", type=["pdf"],
                                 accept_multiple_files=True,
                                 key=f"pdfzip_upload_{st.session_state.pdfzip_upload_key}")
-    auto_area = st.empty()
-    with auto_area.container():
-        if not uploaded:
-            emitir_descargas(st, [])
+    # Un contenedor estable conserva el receptor entre ACK/reruns; st.empty()
+    # enviaría un vaciado intermedio que puede desmontarlo y perder sus Blob.
+    auto_area = st.container(key="pdfzip_download_area")
 
     signature = obtener_firma_lote(uploaded, profile)
     if signature != st.session_state.pdfzip_signature:
-        with auto_area.container():
-            emitir_descargas(st, [])
         _new_batch(st, signature)
     if not uploaded:
+        with auto_area:
+            emitir_descargas(st, [], enabled=False)
         st.caption("Selecciona la calidad y sube tus PDF para comenzar. Los ZIP estarán disponibles mientras conserves este lote en la sesión.")
         return
 
     cols = st.columns(3)
     if cols[0].button("Vaciar lote", width="stretch"):
-        with auto_area.container():
-            emitir_descargas(st, [])
         _new_batch(st, None)
         st.session_state.pdfzip_upload_key += 1
         st.rerun()
     if cols[1].button("Volver a procesar", width="stretch"):
-        with auto_area.container():
-            emitir_descargas(st, [])
         _new_batch(st, signature)
         st.rerun()
     results = st.session_state.pdfzip_results
@@ -622,15 +742,17 @@ def main():
 
     names = nombres_unicos(uploaded)
     all_parts = [part for result in results.values() if result["status"] == "ok" for part in result["parts"]]
-    with auto_area.container():
-        emitir_descargas(st, all_parts)
-    st.caption("Si tu navegador solicita permiso para varias descargas, permite las descargas de este sitio. También puedes usar los botones que se conservan debajo.")
+    st.caption("Si tu navegador solicita permiso para varias descargas, permite las descargas de este sitio. También puedes usar los botones Descargar cuando los archivos estén listos.")
     st.subheader("Estado del procesamiento")
     for index in range(len(uploaded)):
         if str(index) in results:
             _render_result(st, results[str(index)])
     pending = next((i for i in range(len(uploaded)) if str(i) not in results), None)
     st.progress(len(results) / len(uploaded), text=f"Archivos procesados: {len(results)} de {len(uploaded)}")
+    # Los ACK del componente producen reruns. Esperamos a terminar el lote para
+    # que esas actualizaciones no cancelen un trabajador del siguiente PDF.
+    with auto_area:
+        emitir_descargas(st, all_parts, enabled=pending is None)
     if pending is None:
         errors = sum(result["status"] == "error" for result in results.values())
         if errors:
