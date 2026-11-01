@@ -1,3 +1,5 @@
-streamlit
-pymupdf
-pillow
+streamlit==1.66.1
+starlette==1.10.0
+PyMuPDF==2.0
+# El log de Community Cloud identifica un fallo de PyArrow 26.0.0.
+pyarrow==24.0.0
