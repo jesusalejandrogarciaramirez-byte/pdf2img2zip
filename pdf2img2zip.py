@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import gc
 import hashlib
-import html
 import json
 import logging
 import math
@@ -28,7 +27,7 @@ MAX_ZIP_BYTES = 195 * 1024 * 1024
 MAX_PAGE_PIXELS = 24_000_000
 MAX_WORKER_RSS = 512 * 1024 * 1024
 WORKER_STALL_SECONDS = 300
-SESSION_SCHEMA = 1
+SESSION_SCHEMA = 2
 PROFILES = {
     "Alta": (300, 92),
     "Media alta": (200, 88),
@@ -356,18 +355,71 @@ def ejecutar_conversion(archivo, output_dir: Path, nombre_base: str, perfil: str
 
 def _static_url(path: Path, base_path: str = "") -> str:
     relative = path.resolve().relative_to(STATIC_DIR.resolve())
-    prefix = "/" + base_path.strip("/") if base_path.strip("/") else ""
-    return prefix + "/app/static/" + "/".join(quote(part, safe="") for part in relative.parts)
+    # La ruta pertenece al backend, no a la raíz del portal de Community Cloud.
+    # El navegador conserva su prefijo real (/~/+/ en Cloud) al resolverla.
+    return "app/static/" + "/".join(quote(part, safe="") for part in relative.parts)
+
+
+def leer_zip_validado(path: Path, expected_size: int) -> bytes:
+    """Respaldo diferido nativo: nunca presentar HTML o un archivo parcial como ZIP."""
+    if path.stat().st_size != expected_size:
+        raise ConversionError("El ZIP cambió o quedó incompleto. Vuelve a procesar este PDF.")
+    with path.open("rb") as source:
+        if source.read(4) != b"PK\x03\x04":
+            raise ConversionError("El resultado no es un ZIP válido. Vuelve a procesar este PDF.")
+    if not zipfile.is_zipfile(path):
+        raise ConversionError("No se pudo validar el directorio del ZIP.")
+    return path.read_bytes()
 
 
 # La cola vive en la ventana principal: un rerun no cancela una descarga en curso.
 # Sólo recibe metadatos; ningún ZIP se codifica en base64 ni viaja por el websocket.
 DOWNLOAD_JS = r"""
 (() => {
-  if (window.__pdfzipDownloads) return;
+  if (window.__pdfzipDownloads?.version === 2) return;
+  window.__pdfzipDownloads?.cancel?.();
   const states = new Map(), sent = new Set(), pending = [];
   let wanted = new Set(), active = null, running = false;
   const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
+  function backendUrl(relative) {
+    // La configuración la inyecta Streamlit. Si no existe, usamos la ventana
+    // de la propia app: en Cloud es /~/+/, no el portal que la contiene.
+    const configured = window.__streamlit?.BACKEND_BASE_URL;
+    const base = new URL(configured || window.location.href, window.location.href);
+    if (!['http:', 'https:'].includes(base.protocol)) throw new Error('Backend no válido');
+    base.search = ''; base.hash = '';
+    if (!base.pathname.endsWith('/')) base.pathname += '/';
+    return new URL(relative, base);
+  }
+  async function nativeDownload(file, signal) {
+    const selector = '.st-key-native_' + file.id;
+    const deadline = Date.now() + 90000;
+    let started = false, busySeen = false, observed = null, observer = null;
+    try {
+      while (Date.now() < deadline) {
+        if (signal.aborted || !wanted.has(file.id)) throw new DOMException('Cancelado', 'AbortError');
+        const wrapper = document.querySelector(selector);
+        const button = wrapper?.querySelector('button');
+        if (wrapper?.querySelector('[data-testid="stDownloadButtonError"]')) throw new Error('Falló la descarga nativa');
+        if (button && observed !== button) {
+          observer?.disconnect(); observed = button;
+          observer = new MutationObserver(records => {
+            if (records.some(record => record.attributeName === 'disabled' && record.oldValue === null)) busySeen = true;
+          });
+          observer.observe(button, {attributes: true, attributeFilter: ['disabled'], attributeOldValue: true});
+        }
+        if (button && !started && !button.disabled) {
+          button.click(); started = true;
+          states.set(file.id, 'native');
+        } else if (started && button) {
+          if (button.disabled) busySeen = true;
+          if (busySeen && !button.disabled) return;
+        }
+        await wait(100);
+      }
+      throw new Error('La descarga nativa no confirmó su preparación');
+    } finally { observer?.disconnect(); }
+  }
   const alreadySent = id => {
     try { return sent.has(id) || sessionStorage.getItem('pdfzip:' + id) === 'sent'; }
     catch (_) { return sent.has(id); }
@@ -384,23 +436,31 @@ DOWNLOAD_JS = r"""
         let objectUrl = null;
         try {
           states.set(file.id, 'loading');
-          const url = new URL(file.url, window.location.origin);
-          if (url.origin !== window.location.origin) throw new Error('Origen no válido');
-          const response = await fetch(url.href, {signal: controller.signal, cache: 'no-store', credentials: 'same-origin'});
-          if (!response.ok) throw new Error('HTTP ' + response.status);
-          const blob = await response.blob();
-          if (blob.size !== file.size) throw new Error('Tamaño incompleto');
-          const magic = new Uint8Array(await blob.slice(0, 4).arrayBuffer());
-          if (magic[0] !== 80 || magic[1] !== 75 || magic[2] !== 3 || magic[3] !== 4) throw new Error('El archivo no es un ZIP');
-          if (!wanted.has(file.id) || controller.signal.aborted) continue;
-          objectUrl = URL.createObjectURL(blob);
-          const link = document.createElement('a');
-          link.href = objectUrl;
-          link.download = file.name;
-          link.style.display = 'none';
-          document.body.appendChild(link);
-          link.click();
-          link.remove();
+          try {
+            if (!file.useStatic) throw new Error('Usar transporte nativo');
+            const url = backendUrl(file.url);
+            const response = await fetch(url.href, {signal: controller.signal, cache: 'no-store', credentials: 'same-origin'});
+            if (!response.ok) throw new Error('HTTP ' + response.status);
+            if ((response.headers.get('content-type') || '').toLowerCase().includes('text/html')) throw new Error('El servidor devolvió HTML');
+            const blob = await response.blob();
+            if (blob.size !== file.size) throw new Error('Tamaño incompleto');
+            const magic = new Uint8Array(await blob.slice(0, 4).arrayBuffer());
+            if (magic[0] !== 80 || magic[1] !== 75 || magic[2] !== 3 || magic[3] !== 4) throw new Error('El archivo no es un ZIP');
+            if (!wanted.has(file.id) || controller.signal.aborted) continue;
+            objectUrl = URL.createObjectURL(blob);
+            const link = document.createElement('a');
+            link.href = objectUrl;
+            link.download = file.name;
+            link.style.display = 'none';
+            document.body.appendChild(link);
+            link.click();
+            link.remove();
+          } catch (error) {
+            if (error.name === 'AbortError' || controller.signal.aborted || !wanted.has(file.id)) throw error;
+            // Streamlit resuelve su /media y el origen de descargas. Este botón
+            // permanece renderizado y también sirve como respaldo manual.
+            await nativeDownload(file, controller.signal);
+          }
           sent.add(file.id);
           try { sessionStorage.setItem('pdfzip:' + file.id, 'sent'); } catch (_) {}
           states.set(file.id, 'sent');
@@ -415,6 +475,8 @@ DOWNLOAD_JS = r"""
     } finally { running = false; }
   }
   window.__pdfzipDownloads = {
+    version: 2,
+    cancel() { wanted = new Set(); pending.length = 0; active?.controller.abort(); },
     enqueue(files) {
       wanted = new Set(files.map(file => file.id));
       for (let i = pending.length - 1; i >= 0; i--) if (!wanted.has(pending[i].id)) pending.splice(i, 1);
@@ -434,11 +496,9 @@ DOWNLOAD_JS = r"""
 
 
 def emitir_descargas(st, parts):
-    if not st.get_option("server.enableStaticServing"):
-        return
-    base_path = st.get_option("server.baseUrlPath") or ""
-    files = [{"id": p["id"], "url": _static_url(Path(p["path"]), base_path),
-              "name": p["file_name"], "size": p["size_bytes"]} for p in parts]
+    files = [{"id": p["id"], "url": _static_url(Path(p["path"])),
+              "name": p["file_name"], "size": p["size_bytes"],
+              "useStatic": bool(st.get_option("server.enableStaticServing"))} for p in parts]
     encoded = json.dumps(files, ensure_ascii=True).replace("<", "\\u003c")
     script = json.dumps(DOWNLOAD_JS).replace("<", "\\u003c")
     frame = """<!doctype html><html lang="es"><meta charset="utf-8"><body style="margin:0;font:13px system-ui;color:#666">
@@ -446,7 +506,7 @@ def emitir_descargas(st, parts):
 const files = __FILES__;
 try {
   const owner = window.parent;
-  if (!owner.__pdfzipDownloads) {
+  if (owner.__pdfzipDownloads?.version !== 2) {
     const script = owner.document.createElement('script');
     script.textContent = __SCRIPT__;
     owner.document.head.appendChild(script);
@@ -458,13 +518,13 @@ try {
     const sent = states.filter(s => s === 'sent').length;
     const failed = states.filter(s => s === 'error').length;
     document.getElementById('estado').textContent = !files.length ? '' : failed
-      ? 'No se pudo iniciar alguna descarga. Usa los enlaces de descarga de abajo.'
+      ? 'No se pudo iniciar alguna descarga. Usa los botones de descarga de abajo.'
       : sent < files.length ? 'Preparando descargas automáticas: ' + sent + ' de ' + files.length
-      : 'Descargas solicitadas al navegador: ' + sent + '. Los enlaces de respaldo siguen disponibles.';
+      : 'Descargas solicitadas al navegador: ' + sent + '. Los botones de respaldo siguen disponibles.';
   }
   update(); const timer = setInterval(update, 500);
   window.addEventListener('pagehide', () => clearInterval(timer));
-} catch (_) { document.getElementById('estado').textContent = 'Usa los enlaces de descarga de abajo.'; }
+} catch (_) { document.getElementById('estado').textContent = 'Usa los botones de descarga de abajo.'; }
 </script></body></html>""".replace("__FILES__", encoded).replace("__SCRIPT__", script)
     st.iframe(frame, height=48 if parts else 1)
 
@@ -481,7 +541,7 @@ def _new_batch(st, signature):
     gc.collect()
 
 
-def _render_result(st, result, static_enabled):
+def _render_result(st, result):
     with st.container(border=True):
         if result["status"] == "error":
             st.error(f"{result['pdf_name']}: {result['error']}")
@@ -500,14 +560,12 @@ def _render_result(st, result, static_enabled):
             path = Path(part["path"])
             if not path.is_file():
                 st.warning("Este archivo temporal ya no está disponible. Vuelve a procesar el lote.")
-            elif static_enabled:
-                url = html.escape(_static_url(path, st.get_option("server.baseUrlPath") or ""), quote=True)
-                name = html.escape(part["file_name"], quote=True)
-                st.markdown(f'<a href="{url}" download="{name}" target="_blank" rel="noopener noreferrer" style="display:inline-block;padding:0.55rem 0.9rem;border:1px solid #aaa;border-radius:0.5rem;text-decoration:none">Descargar {name}</a>', unsafe_allow_html=True)
             else:
-                st.download_button(f"Descargar {part['file_name']}", data=path.read_bytes,
+                expected_size = part["size_bytes"]
+                st.download_button(f"Descargar {part['file_name']}",
+                                   data=lambda path=path, size=expected_size: leer_zip_validado(path, size),
                                    file_name=part["file_name"], mime="application/zip",
-                                   key="manual_" + part["id"], on_click="ignore")
+                                   key="native_" + part["id"], on_click="ignore")
 
 
 def main():
@@ -530,9 +588,6 @@ def main():
     uploaded = st.file_uploader("Sube uno o varios archivos PDF", type=["pdf"],
                                 accept_multiple_files=True,
                                 key=f"pdfzip_upload_{st.session_state.pdfzip_upload_key}")
-    static_enabled = bool(st.get_option("server.enableStaticServing"))
-    if not static_enabled:
-        st.warning("Para activar las descargas automáticas, incluye .streamlit/config.toml del paquete y reinicia la app. Puedes descargar los resultados manualmente mientras tanto.")
     auto_area = st.empty()
     with auto_area.container():
         if not uploaded:
@@ -569,11 +624,11 @@ def main():
     all_parts = [part for result in results.values() if result["status"] == "ok" for part in result["parts"]]
     with auto_area.container():
         emitir_descargas(st, all_parts)
-    st.caption("Si tu navegador solicita permiso para varias descargas, permite las descargas de este sitio. También puedes usar los enlaces que se conservan debajo.")
+    st.caption("Si tu navegador solicita permiso para varias descargas, permite las descargas de este sitio. También puedes usar los botones que se conservan debajo.")
     st.subheader("Estado del procesamiento")
     for index in range(len(uploaded)):
         if str(index) in results:
-            _render_result(st, results[str(index)], static_enabled)
+            _render_result(st, results[str(index)])
     pending = next((i for i in range(len(uploaded)) if str(i) not in results), None)
     st.progress(len(results) / len(uploaded), text=f"Archivos procesados: {len(results)} de {len(uploaded)}")
     if pending is None:
@@ -581,7 +636,7 @@ def main():
         if errors:
             st.warning(f"Lote terminado: {len(results) - errors} PDF convertidos y {errors} con error. Puedes descargar los resultados válidos y reintentar los fallidos.")
         else:
-            st.success("Todos los archivos fueron convertidos. Los enlaces de descarga siguen disponibles.")
+            st.success("Todos los archivos fueron convertidos. Los botones de descarga siguen disponibles.")
         return
 
     archivo = uploaded[pending]
